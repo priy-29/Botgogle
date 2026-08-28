@@ -1,0 +1,14 @@
+{
+  "name": "telegram-googleform-bot",
+  "version": "1.0.0",
+  "description": "Bot Telegram Interaktif untuk Google Form & Upload Drive",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "googleapis": "^128.0.0",
+    "telegraf": "^4.15.3"
+  }
+}
