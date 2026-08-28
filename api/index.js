@@ -1,493 +1,404 @@
-const {
-  Telegraf,
-  Markup
-} = require("telegraf");
+const axios = require("axios");
+const { google } = require("googleapis");
+const crypto = require("crypto");
 
-const {
-  Redis
-} = require("@upstash/redis");
+const SCOPES = [
+  "openid",
+  "email",
+  "profile",
+  "https://www.googleapis.com/auth/forms.body.readonly",
+  "https://www.googleapis.com/auth/drive.file"
+];
 
-const google = require("./google");
-
-const bot =
-  new Telegraf(process.env.BOT_TOKEN);
-
-const redis =
-  Redis.fromEnv();
-
-const tokenKey =
-  chatId => `google:${chatId}`;
-
-const stateKey =
-  state => `oauth:${state}`;
-
-const sessionKey =
-  chatId => `session:${chatId}`;
-
-async function login(chatId) {
-  const state =
-    google.createState();
-
-  await redis.set(
-    stateKey(state),
-    String(chatId),
-    { ex: 600 }
-  );
-
-  return google.loginUrl(state);
-}
-
-function questionText(
-  field,
-  index,
-  total
-) {
-  let text =
-    `📋 Pertanyaan ${index + 1}/${total}\n\n` +
-    field.title;
-
-  if (field.required) {
-    text += " *";
-  }
-
-  if (field.options.length) {
-    text += "\n\nPilihan:";
-
-    field.options.forEach(
-      (option, i) => {
-        text +=
-          `\n${i + 1}. ${option}`;
-      }
-    );
-
-    if (field.type === 4) {
-      text +=
-        "\n\nUntuk checkbox, kirim nomor dipisah koma. Contoh: 1,3";
-    }
-  }
-
-  return text;
-}
-
-async function sendQuestion(
-  ctx,
-  session
-) {
-  const field =
-    session.form.fields[
-      session.index
-    ];
-
-  return ctx.reply(
-    questionText(
-      field,
-      session.index,
-      session.form.fields.length
-    )
+function oauthClient() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
   );
 }
 
-bot.start(async ctx => {
-  const account =
-    await redis.get(
-      tokenKey(ctx.chat.id)
+function getFormId(url) {
+  try {
+    const u = new URL(url);
+
+    const match = u.pathname.match(
+      /\/forms\/(?:u\/\d+\/)?d\/(?:e\/)?([^/]+)/
     );
 
-  if (account) {
-    return ctx.reply(
-      `🤖 Botgogle\n\n` +
-      `Google: ✅ Terhubung\n` +
-      `👤 ${account.name || "-"}\n` +
-      `📧 ${account.email || "-"}\n\n` +
-      `Kirim link Google Form.`,
-      Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "🔓 Ganti Akun",
-            "google_login"
-          )
-        ],
-        [
-          Markup.button.callback(
-            "❌ Putuskan Google",
-            "google_logout"
-          )
-        ]
-      ])
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function getCanonicalUrl(url) {
+  const id = getFormId(url);
+
+  if (!id) {
+    throw new Error("Link Google Form tidak valid.");
+  }
+
+  return `https://docs.google.com/forms/d/e/${id}/viewform`;
+}
+
+function getSubmitUrl(url) {
+  const id = getFormId(url);
+
+  if (!id) {
+    throw new Error("Link Google Form tidak valid.");
+  }
+
+  return `https://docs.google.com/forms/d/e/${id}/formResponse`;
+}
+
+function extractPublicData(html) {
+  const marker = "FB_PUBLIC_LOAD_DATA_";
+  const start = html.indexOf(marker);
+
+  if (start === -1) {
+    throw new Error(
+      "Google Form tidak bisa dibaca. Pastikan Form dapat dibuka tanpa login."
     );
   }
 
-  const url =
-    await login(ctx.chat.id);
+  const equal = html.indexOf("=", start);
 
-  return ctx.reply(
-    "🤖 Botgogle\n\nGoogle: ❌ Belum terhubung",
-    Markup.inlineKeyboard([
-      [
-        Markup.button.url(
-          "🔐 Login Google",
-          url
-        )
-      ]
-    ])
+  if (equal === -1) {
+    throw new Error("Struktur Google Form tidak ditemukan.");
+  }
+
+  let i = equal + 1;
+
+  while (/\s/.test(html[i])) i++;
+
+  if (html[i] !== "[") {
+    throw new Error("Data Google Form tidak valid.");
+  }
+
+  const begin = i;
+  let depth = 0;
+  let quote = false;
+  let escape = false;
+
+  for (; i < html.length; i++) {
+    const char = html[i];
+
+    if (quote) {
+      if (escape) {
+        escape = false;
+      } else if (char === "\\") {
+        escape = true;
+      } else if (char === '"') {
+        quote = false;
+      }
+
+      continue;
+    }
+
+    if (char === '"') {
+      quote = true;
+      continue;
+    }
+
+    if (char === "[") depth++;
+
+    if (char === "]") {
+      depth--;
+
+      if (depth === 0) {
+        return JSON.parse(
+          html.slice(begin, i + 1)
+        );
+      }
+    }
+  }
+
+  throw new Error(
+    "Data Google Form tidak lengkap."
   );
-});
+}
 
-bot.action(
-  "google_login",
-  async ctx => {
-    await ctx.answerCbQuery();
-
-    const url =
-      await login(ctx.chat.id);
-
-    await ctx.reply(
-      "🔐 Login Google:",
-      Markup.inlineKeyboard([
-        [
-          Markup.button.url(
-            "Login dengan Google",
-            url
-          )
-        ]
-      ])
-    );
-  }
-);
-
-bot.action(
-  "google_logout",
-  async ctx => {
-    await redis.del(
-      tokenKey(ctx.chat.id)
-    );
-
-    await redis.del(
-      sessionKey(ctx.chat.id)
-    );
-
-    await ctx.answerCbQuery(
-      "Google diputuskan"
-    );
-
-    await ctx.reply(
-      "✅ Akun Google sudah diputuskan."
-    );
-  }
-);
-
-bot.command(
-  "cancel",
-  async ctx => {
-    await redis.del(
-      sessionKey(ctx.chat.id)
-    );
-
-    await ctx.reply(
-      "❌ Sesi dibatalkan."
-    );
-  }
-);
-
-bot.on(
-  "message",
-  async ctx => {
-    const text =
-      ctx.message.text ||
-      ctx.message.caption ||
-      "";
-
-    const chatId =
-      ctx.chat.id;
-
-    const formUrl =
-      google.getFormUrl(text);
-
-    if (formUrl) {
-      const account =
-        await redis.get(
-          tokenKey(chatId)
-        );
-
-      if (!account) {
-        const url =
-          await login(chatId);
-
-        return ctx.reply(
-          "❌ Login Google dulu.",
-          Markup.inlineKeyboard([
-            [
-              Markup.button.url(
-                "🔐 Login Google",
-                url
-              )
-            ]
-          ])
-        );
-      }
-
-      await ctx.reply(
-        "🔍 Sedang membaca Google Form..."
-      );
-
-      try {
-        const form =
-          await google.readForm(
-            formUrl
-          );
-
-        const session = {
-          form,
-          index: 0,
-          answers: {}
-        };
-
-        await redis.set(
-          sessionKey(chatId),
-          session,
-          { ex: 3600 }
-        );
-
-        await ctx.reply(
-          `✅ Form berhasil dibaca!\n\n` +
-          `📋 ${form.title || "Google Form"}\n` +
-          `📝 ${form.fields.length} pertanyaan`
-        );
-
-        return sendQuestion(
-          ctx,
-          session
-        );
-      } catch (err) {
-        console.error(err);
-
-        return ctx.reply(
-          `❌ Gagal membaca formulir.\n\n${err.message}`
-        );
-      }
-    }
-
-    const session =
-      await redis.get(
-        sessionKey(chatId)
-      );
-
-    if (
-      !session ||
-      !text
-    ) {
-      return;
-    }
-
-    const field =
-      session.form.fields[
-        session.index
-      ];
-
-    if (!field) {
-      await redis.del(
-        sessionKey(chatId)
-      );
-      return;
-    }
-
-    if (
-      field.required &&
-      !text.trim()
-    ) {
-      return ctx.reply(
-        "❌ Pertanyaan ini wajib diisi."
-      );
-    }
-
-    session.answers[
-      field.entryIds[0]
-    ] = text.trim();
-
-    session.index++;
-
-    if (
-      session.index <
-      session.form.fields.length
-    ) {
-      await redis.set(
-        sessionKey(chatId),
-        session,
-        { ex: 3600 }
-      );
-
-      return sendQuestion(
-        ctx,
-        session
-      );
-    }
-
-    await ctx.reply(
-      "📤 Mengirim jawaban ke Google Form..."
-    );
-
-    try {
-      await google.submitForm(
-        session.form,
-        session.answers
-      );
-
-      await redis.del(
-        sessionKey(chatId)
-      );
-
-      return ctx.reply(
-        `✅ Berhasil dikirim!\n\n` +
-        `📋 ${session.form.title || "Google Form"}\n` +
-        `📝 ${session.form.fields.length} jawaban`
-      );
-    } catch (err) {
-      console.error(err);
-
-      await redis.set(
-        sessionKey(chatId),
-        session,
-        { ex: 3600 }
-      );
-
-      return ctx.reply(
-        `❌ Gagal mengirim jawaban.\n\n${err.message}`
-      );
-    }
-  }
-);
-
-module.exports =
-  async (req, res) => {
-    try {
-      if (
-        req.method === "GET" &&
-        req.query?.code &&
-        req.query?.state
-      ) {
-        const chatId =
-          await redis.get(
-            stateKey(
-              req.query.state
-            )
-          );
-
-        if (!chatId) {
-          return res
-            .status(400)
-            .send(
-              "Login expired."
-            );
-        }
-
-        await redis.del(
-          stateKey(
-            req.query.state
-          )
-        );
-
-        const result =
-          await google.exchange(
-            req.query.code
-          );
-
-        const old =
-          await redis.get(
-            tokenKey(chatId)
-          );
-
-        await redis.set(
-          tokenKey(chatId),
-          {
-            ...result.tokens,
-            refresh_token:
-              result.tokens.refresh_token ||
-              old?.refresh_token,
-            email:
-              result.profile.email,
-            name:
-              result.profile.name
-          }
-        );
-
-        await bot.telegram.sendMessage(
-          chatId,
-          `✅ Google berhasil terhubung!\n\n` +
-          `👤 ${result.profile.name || "-"}\n` +
-          `📧 ${result.profile.email || "-"}\n\n` +
-          `Sekarang kirim link Google Form.`
-        );
-
-        return res
-          .status(200)
-          .send(`
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width">
-<title>Botgogle</title>
-<style>
-body{background:#111;color:#fff;font-family:Arial;text-align:center;padding:60px 20px}
-.box{max-width:400px;margin:auto;background:#222;padding:30px;border-radius:20px}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>✅</h1>
-<h2>Google berhasil terhubung</h2>
-<p>${escapeHtml(
-  result.profile.email || ""
-)}</p>
-<p>Kembali ke Telegram.</p>
-</div>
-</body>
-</html>
-        `);
-      }
-
-      if (
-        req.method === "POST"
-      ) {
-        await bot.handleUpdate(
-          req.body,
-          res
-        );
-        return;
-      }
-
-      return res
-        .status(200)
-        .send(
-          "Botgogle API berjalan."
-        );
-    } catch (err) {
-      console.error(err);
-
-      return res
-        .status(500)
-        .send(
-          "Server Error"
-        );
-    }
+function parseFormData(data) {
+  const result = {
+    title: "",
+    fields: []
   };
 
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(
-      /</g,
-      "&lt;"
-    )
-    .replace(
-      />/g,
-      "&gt;"
-    )
-    .replace(
-      /"/g,
-      "&quot;"
-    )
-    .replace(
-      /'/g,
-      "&#039;"
+  const root =
+    Array.isArray(data?.[1])
+      ? data[1]
+      : [];
+
+  result.title =
+    typeof root[8] === "string"
+      ? root[8]
+      : "";
+
+  const items =
+    Array.isArray(root[1])
+      ? root[1]
+      : [];
+
+  for (const item of items) {
+    if (!Array.isArray(item)) continue;
+
+    const title =
+      typeof item[1] === "string"
+        ? item[1]
+        : "Pertanyaan";
+
+    const type = item[3];
+
+    const data =
+      Array.isArray(item[4])
+        ? item[4]
+        : [];
+
+    const entryIds = [];
+    const options = [];
+
+    for (const row of data) {
+      if (!Array.isArray(row)) continue;
+
+      if (
+        row[0] !== undefined &&
+        (
+          typeof row[0] === "number" ||
+          typeof row[0] === "string"
+        )
+      ) {
+        const value = String(row[0]);
+
+        if (value.startsWith("entry.")) {
+          entryIds.push(
+            value.replace("entry.", "")
+          );
+        } else if (/^\d+$/.test(value)) {
+          entryIds.push(value);
+        }
+      }
+
+      if (Array.isArray(row[1])) {
+        for (const opt of row[1]) {
+          if (
+            Array.isArray(opt) &&
+            typeof opt[0] === "string"
+          ) {
+            options.push(opt[0]);
+          }
+        }
+      }
+    }
+
+    const uniqueIds =
+      [...new Set(entryIds)];
+
+    if (!uniqueIds.length) continue;
+
+    result.fields.push({
+      title,
+      type,
+      required: false,
+      entryIds: uniqueIds,
+      options: [...new Set(options)]
+    });
+  }
+
+  return result;
+}
+
+async function readForm(url) {
+  const canonical =
+    getCanonicalUrl(url);
+
+  const { data: html } =
+    await axios.get(
+      canonical,
+      {
+        timeout: 30000,
+        maxRedirects: 10,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36",
+          "Accept":
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language":
+            "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+          "Cache-Control":
+            "no-cache"
+        },
+        validateStatus: status =>
+          status >= 200 &&
+          status < 400
+      }
     );
-               }
+
+  const data =
+    extractPublicData(html);
+
+  const form =
+    parseFormData(data);
+
+  if (!form.fields.length) {
+    throw new Error(
+      "Pertanyaan Form tidak ditemukan."
+    );
+  }
+
+  form.id =
+    getFormId(url);
+
+  form.viewUrl =
+    canonical;
+
+  form.submitUrl =
+    getSubmitUrl(url);
+
+  return form;
+}
+
+function normalizeAnswer(
+  field,
+  answer
+) {
+  const value =
+    String(answer || "").trim();
+
+  if (!field.options.length) {
+    return value;
+  }
+
+  if (/^\d+$/.test(value)) {
+    const number =
+      Number(value);
+
+    if (
+      number >= 1 &&
+      number <= field.options.length
+    ) {
+      return field.options[number - 1];
+    }
+  }
+
+  return value;
+}
+
+async function submitForm(
+  form,
+  answers
+) {
+  const params =
+    new URLSearchParams();
+
+  for (const field of form.fields) {
+    const entry =
+      field.entryIds[0];
+
+    const answer =
+      answers[entry];
+
+    if (
+      answer === undefined ||
+      answer === null ||
+      answer === ""
+    ) {
+      continue;
+    }
+
+    params.append(
+      `entry.${entry}`,
+      normalizeAnswer(
+        field,
+        answer
+      )
+    );
+  }
+
+  const response =
+    await axios.post(
+      form.submitUrl,
+      params.toString(),
+      {
+        timeout: 30000,
+        maxRedirects: 10,
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded",
+          "User-Agent":
+            "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36"
+        },
+        validateStatus: () => true
+      }
+    );
+
+  if (
+    response.status < 200 ||
+    response.status >= 400
+  ) {
+    throw new Error(
+      `Google menolak pengiriman (${response.status}).`
+    );
+  }
+
+  return true;
+}
+
+function loginUrl(state) {
+  return oauthClient().generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: SCOPES,
+    state
+  });
+}
+
+async function exchange(code) {
+  const auth =
+    oauthClient();
+
+  const { tokens } =
+    await auth.getToken(code);
+
+  auth.setCredentials(tokens);
+
+  const oauth2 =
+    google.oauth2({
+      auth,
+      version: "v2"
+    });
+
+  const { data } =
+    await oauth2.userinfo.get();
+
+  return {
+    tokens,
+    profile: data
+  };
+}
+
+function createState() {
+  return crypto
+    .randomBytes(32)
+    .toString("hex");
+}
+
+module.exports = {
+  getFormId,
+  getFormUrl: text => {
+    const match =
+      String(text).match(
+        /https?:\/\/docs\.google\.com\/forms\/[^\s]+/i
+      );
+
+    return match
+      ? match[0].replace(/[)\],.!?]+$/, "")
+      : null;
+  },
+  readForm,
+  submitForm,
+  loginUrl,
+  exchange,
+  createState,
+  oauthClient
+};
