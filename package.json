@@ -1,14 +1,14 @@
 {
-  "name": "telegram-googleform-bot",
+  "name": "botgogle",
   "version": "1.0.0",
-  "description": "Bot Telegram Interaktif untuk Google Form & Upload Drive",
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "googleapis": "^128.0.0",
-    "telegraf": "^4.15.3"
+    "@upstash/redis": "^1.35.3",
+    "axios": "^1.7.9",
+    "googleapis": "^144.0.0",
+    "telegraf": "^4.16.3"
   }
 }
