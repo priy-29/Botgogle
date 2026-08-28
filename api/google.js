@@ -18,45 +18,38 @@ function oauthClient() {
   );
 }
 
-function getFormUrl(text) {
-  const m = String(text).match(
-    /https?:\/\/docs\.google\.com\/forms\/[^\s]+/i
-  );
-
-  if (!m) return null;
-
-  return m[0].replace(/[)\],.!?]+$/, "");
-}
-
 function getFormId(url) {
   try {
     const u = new URL(url);
 
-    const m = u.pathname.match(
+    const match = u.pathname.match(
       /\/forms\/(?:u\/\d+\/)?d\/(?:e\/)?([^/]+)/
     );
 
-    return m ? m[1] : null;
+    return match ? match[1] : null;
   } catch {
     return null;
   }
 }
 
-function responseUrl(url) {
-  const u = new URL(url);
+function getCanonicalUrl(url) {
+  const id = getFormId(url);
 
-  u.pathname = u.pathname.replace(
-    /\/viewform\/?$/,
-    "/formResponse"
-  );
-
-  if (!u.pathname.endsWith("/formResponse")) {
-    u.pathname = u.pathname.replace(/\/?$/, "/formResponse");
+  if (!id) {
+    throw new Error("Link Google Form tidak valid.");
   }
 
-  u.search = "";
+  return `https://docs.google.com/forms/d/e/${id}/viewform`;
+}
 
-  return u.toString();
+function getSubmitUrl(url) {
+  const id = getFormId(url);
+
+  if (!id) {
+    throw new Error("Link Google Form tidak valid.");
+  }
+
+  return `https://docs.google.com/forms/d/e/${id}/formResponse`;
 }
 
 function extractPublicData(html) {
@@ -65,17 +58,17 @@ function extractPublicData(html) {
 
   if (start === -1) {
     throw new Error(
-      "Data Google Form tidak ditemukan. Pastikan Form bisa dibuka publik."
+      "Google Form tidak bisa dibaca. Pastikan Form dapat dibuka tanpa login."
     );
   }
 
-  const eq = html.indexOf("=", start);
+  const equal = html.indexOf("=", start);
 
-  if (eq === -1) {
-    throw new Error("Struktur Google Form tidak terbaca.");
+  if (equal === -1) {
+    throw new Error("Struktur Google Form tidak ditemukan.");
   }
 
-  let i = eq + 1;
+  let i = equal + 1;
 
   while (/\s/.test(html[i])) i++;
 
@@ -89,27 +82,28 @@ function extractPublicData(html) {
   let escape = false;
 
   for (; i < html.length; i++) {
-    const c = html[i];
+    const char = html[i];
 
     if (quote) {
       if (escape) {
         escape = false;
-      } else if (c === "\\") {
+      } else if (char === "\\") {
         escape = true;
-      } else if (c === '"') {
+      } else if (char === '"') {
         quote = false;
       }
+
       continue;
     }
 
-    if (c === '"') {
+    if (char === '"') {
       quote = true;
       continue;
     }
 
-    if (c === "[") depth++;
+    if (char === "[") depth++;
 
-    if (c === "]") {
+    if (char === "]") {
       depth--;
 
       if (depth === 0) {
@@ -120,7 +114,9 @@ function extractPublicData(html) {
     }
   }
 
-  throw new Error("Data Form tidak selesai.");
+  throw new Error(
+    "Data Google Form tidak lengkap."
+  );
 }
 
 function parseFormData(data) {
@@ -130,7 +126,7 @@ function parseFormData(data) {
   };
 
   const root =
-    Array.isArray(data) && Array.isArray(data[1])
+    Array.isArray(data?.[1])
       ? data[1]
       : [];
 
@@ -147,15 +143,14 @@ function parseFormData(data) {
   for (const item of items) {
     if (!Array.isArray(item)) continue;
 
-    const type = item[3];
     const title =
       typeof item[1] === "string"
         ? item[1]
-        : "";
+        : "Pertanyaan";
 
-    if (type === 8) continue;
+    const type = item[3];
 
-    const subs =
+    const data =
       Array.isArray(item[4])
         ? item[4]
         : [];
@@ -163,45 +158,50 @@ function parseFormData(data) {
     const entryIds = [];
     const options = [];
 
-    for (const sub of subs) {
-      if (!Array.isArray(sub)) continue;
+    for (const row of data) {
+      if (!Array.isArray(row)) continue;
 
       if (
-        sub.length &&
-        (typeof sub[0] === "number" ||
-          typeof sub[0] === "string")
+        row[0] !== undefined &&
+        (
+          typeof row[0] === "number" ||
+          typeof row[0] === "string"
+        )
       ) {
-        entryIds.push(String(sub[0]));
+        const value = String(row[0]);
+
+        if (value.startsWith("entry.")) {
+          entryIds.push(
+            value.replace("entry.", "")
+          );
+        } else if (/^\d+$/.test(value)) {
+          entryIds.push(value);
+        }
       }
 
-      if (Array.isArray(sub[1])) {
-        for (const option of sub[1]) {
+      if (Array.isArray(row[1])) {
+        for (const opt of row[1]) {
           if (
-            Array.isArray(option) &&
-            option.length &&
-            typeof option[0] === "string"
+            Array.isArray(opt) &&
+            typeof opt[0] === "string"
           ) {
-            options.push(option[0]);
+            options.push(opt[0]);
           }
         }
       }
     }
 
-    if (!entryIds.length) continue;
+    const uniqueIds =
+      [...new Set(entryIds)];
 
-    const required =
-      subs.some(
-        x =>
-          Array.isArray(x) &&
-          (x[2] === true || x[2] === 1)
-      );
+    if (!uniqueIds.length) continue;
 
     result.fields.push({
-      title: title || "Pertanyaan",
+      title,
       type,
-      required,
-      entryIds,
-      options
+      required: false,
+      entryIds: uniqueIds,
+      options: [...new Set(options)]
     });
   }
 
@@ -209,103 +209,94 @@ function parseFormData(data) {
 }
 
 async function readForm(url) {
-  const formId = getFormId(url);
+  const canonical =
+    getCanonicalUrl(url);
 
-  if (!formId) {
-    throw new Error(
-      "Link Google Form tidak valid."
-    );
-  }
-
-  const u = new URL(url);
-
-  u.search = "";
-
-  if (u.pathname.endsWith("/viewform")) {
-    u.pathname = u.pathname.replace(
-      /\/viewform$/,
-      "/viewform"
-    );
-  }
-
-  const { data: html } = await axios.get(
-    u.toString(),
-    {
-      timeout: 20000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml"
+  const { data: html } =
+    await axios.get(
+      canonical,
+      {
+        timeout: 30000,
+        maxRedirects: 10,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36",
+          "Accept":
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language":
+            "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+          "Cache-Control":
+            "no-cache"
+        },
+        validateStatus: status =>
+          status >= 200 &&
+          status < 400
       }
-    }
-  );
+    );
 
-  const publicData =
+  const data =
     extractPublicData(html);
 
   const form =
-    parseFormData(publicData);
-
-  form.id = formId;
-  form.viewUrl = u.toString();
-  form.submitUrl =
-    responseUrl(u.toString());
+    parseFormData(data);
 
   if (!form.fields.length) {
     throw new Error(
-      "Pertanyaan Google Form tidak ditemukan."
+      "Pertanyaan Form tidak ditemukan."
     );
   }
+
+  form.id =
+    getFormId(url);
+
+  form.viewUrl =
+    canonical;
+
+  form.submitUrl =
+    getSubmitUrl(url);
 
   return form;
 }
 
-function normalizeAnswer(field, answer) {
-  const value = String(answer || "").trim();
+function normalizeAnswer(
+  field,
+  answer
+) {
+  const value =
+    String(answer || "").trim();
 
   if (!field.options.length) {
     return value;
   }
 
   if (/^\d+$/.test(value)) {
-    const n = Number(value);
+    const number =
+      Number(value);
 
-    if (n >= 1 && n <= field.options.length) {
-      return field.options[n - 1];
+    if (
+      number >= 1 &&
+      number <= field.options.length
+    ) {
+      return field.options[number - 1];
     }
-  }
-
-  if (field.type === 4) {
-    return value
-      .split(",")
-      .map(x => x.trim())
-      .filter(Boolean)
-      .map(x => {
-        if (/^\d+$/.test(x)) {
-          const n = Number(x);
-
-          if (
-            n >= 1 &&
-            n <= field.options.length
-          ) {
-            return field.options[n - 1];
-          }
-        }
-
-        return x;
-      });
   }
 
   return value;
 }
 
-async function submitForm(form, answers) {
-  const params = new URLSearchParams();
+async function submitForm(
+  form,
+  answers
+) {
+  const params =
+    new URLSearchParams();
 
   for (const field of form.fields) {
+    const entry =
+      field.entryIds[0];
+
     const answer =
-      answers[field.entryIds[0]];
+      answers[entry];
 
     if (
       answer === undefined ||
@@ -315,22 +306,13 @@ async function submitForm(form, answers) {
       continue;
     }
 
-    const value =
-      normalizeAnswer(field, answer);
-
-    if (Array.isArray(value)) {
-      for (const v of value) {
-        params.append(
-          `entry.${field.entryIds[0]}`,
-          v
-        );
-      }
-    } else {
-      params.append(
-        `entry.${field.entryIds[0]}`,
-        value
-      );
-    }
+    params.append(
+      `entry.${entry}`,
+      normalizeAnswer(
+        field,
+        answer
+      )
+    );
   }
 
   const response =
@@ -339,12 +321,12 @@ async function submitForm(form, answers) {
       params.toString(),
       {
         timeout: 30000,
-        maxRedirects: 5,
+        maxRedirects: 10,
         headers: {
           "Content-Type":
             "application/x-www-form-urlencoded",
           "User-Agent":
-            "Mozilla/5.0"
+            "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36"
         },
         validateStatus: () => true
       }
@@ -372,17 +354,19 @@ function loginUrl(state) {
 }
 
 async function exchange(code) {
-  const auth = oauthClient();
+  const auth =
+    oauthClient();
 
   const { tokens } =
     await auth.getToken(code);
 
   auth.setCredentials(tokens);
 
-  const oauth2 = google.oauth2({
-    auth,
-    version: "v2"
-  });
+  const oauth2 =
+    google.oauth2({
+      auth,
+      version: "v2"
+    });
 
   const { data } =
     await oauth2.userinfo.get();
@@ -400,8 +384,17 @@ function createState() {
 }
 
 module.exports = {
-  getFormUrl,
   getFormId,
+  getFormUrl: text => {
+    const match =
+      String(text).match(
+        /https?:\/\/docs\.google\.com\/forms\/[^\s]+/i
+      );
+
+    return match
+      ? match[0].replace(/[)\],.!?]+$/, "")
+      : null;
+  },
   readForm,
   submitForm,
   loginUrl,
